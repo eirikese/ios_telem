@@ -1,1 +1,241 @@
 
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>M5 IMU+GPS Publisher (single-file)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0b0f" />
+  <style>
+    :root { --bg:#0b0b0f; --fg:#e6e6e9; --muted:#9aa0a6; --accent:#61dafb; --bad:#ff6b6b; --ok:#30d158 }
+    *{box-sizing:border-box} html,body{height:100%}
+    body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+    header{padding:16px 20px;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center}
+    header h1{margin:0;font-size:16px;color:var(--muted);font-weight:600}
+    header .ver{font-size:12px;color:var(--muted)}
+    main{padding:16px 16px 76px}
+    .card{background:#121218;border:1px solid #222;border-radius:12px;padding:14px;margin-bottom:14px}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    .row>*{flex:1 1 150px}
+    label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+    input,button{width:100%;padding:10px;border-radius:10px;border:1px solid #2a2a34;background:#121218;color:var(--fg)}
+    button.primary{background:var(--accent);color:#001018;border:none;font-weight:700}
+    button.good{background:var(--ok);color:#001108;border:none}
+    button.bad{background:#2b1a1a;border:1px solid #3c1b1b;color:#ffb3b3}
+    .kv{display:grid;grid-template-columns:1fr auto;gap:6px;font-variant-numeric:tabular-nums}
+    .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:8px;vertical-align:middle}
+    .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    .small{font-size:12px;color:var(--muted)}
+  </style>
+  <!-- mqtt.js from CDN -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>M5 IMU+GPS Publisher</h1>
+    <div class="ver">v0.1 • single-file</div>
+  </header>
+
+  <main>
+    <!-- Status -->
+    <div class="card">
+      <div class="kv">
+        <div><span id="mqtt-dot" class="dot bad"></span>MQTT</div><div id="mqtt-status">disconnected</div>
+        <div><span id="sensor-dot" class="dot bad"></span>Sensors</div><div id="sensor-status">disabled</div>
+        <div><span id="gps-dot" class="dot bad"></span>GPS</div><div id="gps-status">waiting</div>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>Unit ID</label>
+          <input id="unitId" placeholder="Eirik" />
+        </div>
+        <div>
+          <label>Publish Rate (Hz)</label>
+          <input id="pubHz" type="number" min="1" max="30" step="1" value="10" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Broker URL (WSS)</label>
+          <input id="brokerUrl" class="mono" value="wss://afe7881f82fe42929e4a5370cddc7285.s1.eu.hivemq.cloud:8884/mqtt" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>MQTT Username</label>
+          <input id="mqttUser" value="wildsailor" />
+        </div>
+        <div>
+          <label>MQTT Password</label>
+          <input id="mqttPass" type="password" value="Sailorinthewild1" />
+        </div>
+      </div>
+      <div class="row">
+        <button id="enableSensors" class="primary">Enable Sensors</button>
+        <button id="connectBtn" class="good">Connect MQTT</button>
+        <button id="disconnectBtn" class="bad">Disconnect</button>
+      </div>
+      <div class="small">
+        Publishes to <span class="mono">m5/&lt;UnitID&gt;/telemetry</span> and sets <span class="mono">m5/&lt;UnitID&gt;/status</span> to <em>online/offline</em>.
+      </div>
+    </div>
+
+    <!-- Live data -->
+    <div class="card">
+      <div class="row">
+        <div><label>Roll (deg)</label><div id="roll" class="mono">--</div></div>
+        <div><label>Pitch (deg)</label><div id="pitch" class="mono">--</div></div>
+      </div>
+      <div class="row">
+        <div><label>Lat</label><div id="lat" class="mono">--</div></div>
+        <div><label>Lon</label><div id="lon" class="mono">--</div></div>
+      </div>
+      <div class="row">
+        <div><label>Gyro β/γ (deg/s)</label><div id="gyro" class="mono">--</div></div>
+        <div><label>Accel ax/ay/az (m/s²)</label><div id="acc" class="mono">--</div></div>
+      </div>
+      <div class="small">Mapping: roll←gyroX(β), pitch←gyroY(γ). Accel angles via atan2 like your ESP32.</div>
+    </div>
+
+    <!-- Log -->
+    <div class="card">
+      <label>Last JSON</label>
+      <pre id="lastJson" class="mono" style="white-space:pre-wrap;margin:0">—</pre>
+    </div>
+  </main>
+
+<script type="module">
+/*** SimpleKalman: JS port of your C++ struct ***/
+class SimpleKalman {
+  constructor(){ this.Q_angle=0.001; this.Q_bias=0.003; this.R_measure=0.03;
+    this.angle=0; this.bias=0; this.P00=0; this.P01=0; this.P10=0; this.P11=0; }
+  setAngle(a){ this.angle=a; }
+  update(rate_deg_s, meas_deg, dt){
+    const rate = rate_deg_s - this.bias;
+    this.angle += dt * rate;
+    this.P00 += dt*(dt*this.P11 - this.P01 - this.P10 + this.Q_angle);
+    this.P01 -= dt*this.P11; this.P10 -= dt*this.P11; this.P11 += this.Q_bias*dt;
+    const S = this.P00 + this.R_measure, K0 = this.P00/S, K1 = this.P10/S;
+    const y = meas_deg - this.angle;
+    this.angle += K0*y; this.bias += K1*y;
+    const P00n = this.P00 - K0*this.P00, P01n = this.P01 - K0*this.P01;
+    const P10n = this.P10 - K1*this.P00, P11n = this.P11 - K1*this.P01;
+    this.P00=P00n; this.P01=P01n; this.P10=P10n; this.P11=P11n;
+    return this.angle;
+  }
+}
+
+/*** DOM refs ***/
+const $ = id => document.getElementById(id);
+const mqttDot = $('mqtt-dot'), sensorDot = $('sensor-dot'), gpsDot = $('gps-dot');
+const mqttStatus = $('mqtt-status'), sensorStatus = $('sensor-status'), gpsStatus = $('gps-status');
+const rollEl=$('roll'), pitchEl=$('pitch'), gyroEl=$('gyro'), accEl=$('acc'), lastJson=$('lastJson');
+const unitIdIn=$('unitId'), brokerUrlIn=$('brokerUrl'), mqttUserIn=$('mqttUser'), mqttPassIn=$('mqttPass'), pubHzIn=$('pubHz');
+const enableBtn=$('enableSensors'), connectBtn=$('connectBtn'), disconnectBtn=$('disconnectBtn');
+
+/*** State ***/
+let client=null, connected=false, seq=0;
+let latest={ax:0,ay:0,az:0,gx:0,gy:0,ts:0};
+let lat=null, lon=null, lastGpsTs=0;
+const RAD2DEG = 180/Math.PI;
+const kfRoll=new SimpleKalman(), kfPitch=new SimpleKalman(); let kfPrimed=false;
+
+unitIdIn.value = localStorage.getItem('unitId') || 'Eirik';
+
+function setDot(dot, ok){ dot.classList.toggle('ok', ok); dot.classList.toggle('bad', !ok); }
+function setStatus(elm, txt){ elm.textContent = txt; }
+
+function computeAngles(dt){
+  const {ax, ay, az, gx, gy} = latest;
+  const rollAcc  = Math.atan2(ay, az) * RAD2DEG;
+  const pitchAcc = Math.atan2(-ax, Math.hypot(ay, az)) * RAD2DEG;
+  if (!kfPrimed){ kfRoll.setAngle(rollAcc); kfPitch.setAngle(pitchAcc); kfPrimed=true; }
+  const roll = kfRoll.update(gx, rollAcc, dt);
+  const pitch = kfPitch.update(gy, pitchAcc, dt);
+  return {roll, pitch};
+}
+const topics = uid => ({ tele:`m5/${uid}/telemetry`, status:`m5/${uid}/status` });
+
+/*** Sensors ***/
+async function enableSensors(){
+  try{
+    if (typeof DeviceMotionEvent!=='undefined' && typeof DeviceMotionEvent.requestPermission==='function'){
+      const resp = await DeviceMotionEvent.requestPermission();
+      if (resp!=='granted') throw new Error('Motion permission denied');
+    }
+    startMotion(); startGPS();
+    setDot(sensorDot,true); setStatus(sensorStatus,'enabled');
+  }catch(err){
+    setDot(sensorDot,false); setStatus(sensorStatus,'error: '+err.message);
+  }
+}
+function startMotion(){
+  let lastTs=0;
+  window.addEventListener('devicemotion', e=>{
+    const now = performance.now(), dt = lastTs ? (now-lastTs)/1000 : 0.016; lastTs=now;
+    const a=e.accelerationIncludingGravity||{}, r=e.rotationRate||{};
+    latest.ax=a.x??0; latest.ay=a.y??0; latest.az=a.z??0;
+    latest.gx=r.beta??0; latest.gy=r.gamma??0; latest.ts=now;
+    const {roll,pitch}=computeAngles(Math.max(0.001,dt));
+    rollEl.textContent=roll.toFixed(2); pitchEl.textContent=pitch.toFixed(2);
+    gyroEl.textContent=`${(latest.gx||0).toFixed(1)}, ${(latest.gy||0).toFixed(1)}`;
+    accEl.textContent =`${(latest.ax||0).toFixed(2)}, ${(latest.ay||0).toFixed(2)}, ${(latest.az||0).toFixed(2)}`;
+  }, {capture:false});
+}
+function startGPS(){
+  if (!('geolocation' in navigator)){ setStatus(gpsStatus,'unavailable'); setDot(gpsDot,false); return; }
+  navigator.geolocation.watchPosition(pos=>{
+    lat=pos.coords.latitude; lon=pos.coords.longitude; lastGpsTs=Date.now();
+    $('lat').textContent=lat.toFixed(6); $('lon').textContent=lon.toFixed(6);
+    setStatus(gpsStatus,'ok'); setDot(gpsDot,true);
+  }, err=>{ setStatus(gpsStatus,'err '+err.code); setDot(gpsDot,false); },
+  {enableHighAccuracy:true, maximumAge:2000, timeout:10000});
+}
+
+/*** MQTT ***/
+function connectMQTT(){
+  const unitId=(unitIdIn.value||'web').trim(); localStorage.setItem('unitId',unitId);
+  const url=brokerUrlIn.value.trim(), username=mqttUserIn.value.trim(), password=mqttPassIn.value;
+  const will={topic:topics(unitId).status, payload:'offline', qos:0, retain:true};
+  const clientId=`iphone-${Math.random().toString(16).slice(2,10)}`;
+  client = mqtt.connect(url,{clean:true, connectTimeout:10000, clientId, username, password, protocolVersion:4, will});
+  client.on('connect',()=>{ connected=true; setDot(mqttDot,true); setStatus(mqttStatus,`connected (${clientId})`);
+    client.publish(topics(unitId).status,'online',{retain:true}); });
+  client.on('reconnect',()=>setStatus(mqttStatus,'reconnecting...'));
+  client.on('close',()=>{ connected=false; setDot(mqttDot,false); setStatus(mqttStatus,'disconnected'); });
+  client.on('error',err=>{ setDot(mqttDot,false); setStatus(mqttStatus,'error: '+err.message); });
+}
+function disconnectMQTT(){ if(client){ client.end(true); } connected=false; setDot(mqttDot,false); setStatus(mqttStatus,'disconnected'); }
+
+/*** Publisher @ configurable Hz (default 10) ***/
+let pubTimer=null;
+function startPublishing(){
+  if (pubTimer) clearInterval(pubTimer);
+  const hz = Math.max(1, Math.min(30, parseInt(pubHzIn.value||'10',10)));
+  const period = 1000/hz;
+  pubTimer=setInterval(()=>{
+    if(!connected) return;
+    const unitId=(unitIdIn.value||'web').trim(), t=topics(unitId);
+    const {roll,pitch}=computeAngles(1/Math.max(1,hz));
+    const gps_ok = (Date.now()-lastGpsTs) < 3000;
+    const payload = gps_ok
+      ? {unit_id:unitId, seq:seq++, roll_deg:+roll.toFixed(2), pitch_deg:+pitch.toFixed(2), lat, lon}
+      : {unit_id:unitId, seq:seq++, roll_deg:+roll.toFixed(2), pitch_deg:+pitch.toFixed(2), lat:null, lon:null};
+    const json = JSON.stringify(payload);
+    lastJson.textContent = json;
+    client.publish(t.tele, json);
+  }, period);
+}
+
+/*** UI wiring ***/
+$('enableSensors').addEventListener('click', enableSensors);
+$('connectBtn').addEventListener('click', ()=>{ connectMQTT(); startPublishing(); });
+$('disconnectBtn').addEventListener('click', ()=>{ disconnectMQTT(); if (pubTimer) clearInterval(pubTimer); });
+</script>
+</body>
+</html>

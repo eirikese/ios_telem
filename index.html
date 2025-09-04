@@ -1,9 +1,8 @@
-
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>M5 IMU+GPS Publisher (single-file)</title>
+  <title>M5 IMU+GPS Publisher (iPhone native roll/pitch)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0b0b0f" />
   <style>
@@ -34,7 +33,7 @@
 <body>
   <header>
     <h1>M5 IMU+GPS Publisher</h1>
-    <div class="ver">v0.1 • single-file</div>
+    <div class="ver">v0.2 • native roll/pitch</div>
   </header>
 
   <main>
@@ -88,18 +87,14 @@
     <!-- Live data -->
     <div class="card">
       <div class="row">
-        <div><label>Roll (deg)</label><div id="roll" class="mono">--</div></div>
-        <div><label>Pitch (deg)</label><div id="pitch" class="mono">--</div></div>
+        <div><label>Roll (deg, γ)</label><div id="roll" class="mono">--</div></div>
+        <div><label>Pitch (deg, β)</label><div id="pitch" class="mono">--</div></div>
       </div>
       <div class="row">
         <div><label>Lat</label><div id="lat" class="mono">--</div></div>
         <div><label>Lon</label><div id="lon" class="mono">--</div></div>
       </div>
-      <div class="row">
-        <div><label>Gyro β/γ (deg/s)</label><div id="gyro" class="mono">--</div></div>
-        <div><label>Accel ax/ay/az (m/s²)</label><div id="acc" class="mono">--</div></div>
-      </div>
-      <div class="small">Mapping: roll←gyroX(β), pitch←gyroY(γ). Accel angles via atan2 like your ESP32.</div>
+      <div class="small">Using iPhone’s native <span class="mono">deviceorientation</span>: pitch=β (X axis), roll=γ (Y axis). Alpha (yaw) is unused.</div>
     </div>
 
     <!-- Log -->
@@ -110,83 +105,52 @@
   </main>
 
 <script type="module">
-/*** SimpleKalman: JS port of your C++ struct ***/
-class SimpleKalman {
-  constructor(){ this.Q_angle=0.001; this.Q_bias=0.003; this.R_measure=0.03;
-    this.angle=0; this.bias=0; this.P00=0; this.P01=0; this.P10=0; this.P11=0; }
-  setAngle(a){ this.angle=a; }
-  update(rate_deg_s, meas_deg, dt){
-    const rate = rate_deg_s - this.bias;
-    this.angle += dt * rate;
-    this.P00 += dt*(dt*this.P11 - this.P01 - this.P10 + this.Q_angle);
-    this.P01 -= dt*this.P11; this.P10 -= dt*this.P11; this.P11 += this.Q_bias*dt;
-    const S = this.P00 + this.R_measure, K0 = this.P00/S, K1 = this.P10/S;
-    const y = meas_deg - this.angle;
-    this.angle += K0*y; this.bias += K1*y;
-    const P00n = this.P00 - K0*this.P00, P01n = this.P01 - K0*this.P01;
-    const P10n = this.P10 - K1*this.P00, P11n = this.P11 - K1*this.P01;
-    this.P00=P00n; this.P01=P01n; this.P10=P10n; this.P11=P11n;
-    return this.angle;
-  }
-}
-
 /*** DOM refs ***/
 const $ = id => document.getElementById(id);
 const mqttDot = $('mqtt-dot'), sensorDot = $('sensor-dot'), gpsDot = $('gps-dot');
 const mqttStatus = $('mqtt-status'), sensorStatus = $('sensor-status'), gpsStatus = $('gps-status');
-const rollEl=$('roll'), pitchEl=$('pitch'), gyroEl=$('gyro'), accEl=$('acc'), lastJson=$('lastJson');
+const rollEl=$('roll'), pitchEl=$('pitch'), lastJson=$('lastJson');
 const unitIdIn=$('unitId'), brokerUrlIn=$('brokerUrl'), mqttUserIn=$('mqttUser'), mqttPassIn=$('mqttPass'), pubHzIn=$('pubHz');
-const enableBtn=$('enableSensors'), connectBtn=$('connectBtn'), disconnectBtn=$('disconnectBtn');
 
 /*** State ***/
 let client=null, connected=false, seq=0;
-let latest={ax:0,ay:0,az:0,gx:0,gy:0,ts:0};
 let lat=null, lon=null, lastGpsTs=0;
-const RAD2DEG = 180/Math.PI;
-const kfRoll=new SimpleKalman(), kfPitch=new SimpleKalman(); let kfPrimed=false;
+let roll_deg=null, pitch_deg=null; // native iPhone angles
 
 unitIdIn.value = localStorage.getItem('unitId') || 'Eirik';
 
 function setDot(dot, ok){ dot.classList.toggle('ok', ok); dot.classList.toggle('bad', !ok); }
 function setStatus(elm, txt){ elm.textContent = txt; }
 
-function computeAngles(dt){
-  const {ax, ay, az, gx, gy} = latest;
-  const rollAcc  = Math.atan2(ay, az) * RAD2DEG;
-  const pitchAcc = Math.atan2(-ax, Math.hypot(ay, az)) * RAD2DEG;
-  if (!kfPrimed){ kfRoll.setAngle(rollAcc); kfPitch.setAngle(pitchAcc); kfPrimed=true; }
-  const roll = kfRoll.update(gx, rollAcc, dt);
-  const pitch = kfPitch.update(gy, pitchAcc, dt);
-  return {roll, pitch};
-}
-const topics = uid => ({ tele:`m5/${uid}/telemetry`, status:`m5/${uid}/status` });
-
 /*** Sensors ***/
 async function enableSensors(){
   try{
-    if (typeof DeviceMotionEvent!=='undefined' && typeof DeviceMotionEvent.requestPermission==='function'){
-      const resp = await DeviceMotionEvent.requestPermission();
-      if (resp!=='granted') throw new Error('Motion permission denied');
+    // iOS permissions (need user gesture)
+    if (typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function'){
+      const resp = await DeviceOrientationEvent.requestPermission();
+      if (resp!=='granted') throw new Error('Orientation permission denied');
     }
-    startMotion(); startGPS();
+    startOrientation(); startGPS();
     setDot(sensorDot,true); setStatus(sensorStatus,'enabled');
   }catch(err){
     setDot(sensorDot,false); setStatus(sensorStatus,'error: '+err.message);
   }
 }
-function startMotion(){
-  let lastTs=0;
-  window.addEventListener('devicemotion', e=>{
-    const now = performance.now(), dt = lastTs ? (now-lastTs)/1000 : 0.016; lastTs=now;
-    const a=e.accelerationIncludingGravity||{}, r=e.rotationRate||{};
-    latest.ax=a.x??0; latest.ay=a.y??0; latest.az=a.z??0;
-    latest.gx=r.beta??0; latest.gy=r.gamma??0; latest.ts=now;
-    const {roll,pitch}=computeAngles(Math.max(0.001,dt));
-    rollEl.textContent=roll.toFixed(2); pitchEl.textContent=pitch.toFixed(2);
-    gyroEl.textContent=`${(latest.gx||0).toFixed(1)}, ${(latest.gy||0).toFixed(1)}`;
-    accEl.textContent =`${(latest.ax||0).toFixed(2)}, ${(latest.ay||0).toFixed(2)}, ${(latest.az||0).toFixed(2)}`;
-  }, {capture:false});
+
+// Use deviceorientation: beta (pitch), gamma (roll). Values are degrees.
+function startOrientation(){
+  window.addEventListener('deviceorientation', (e) => {
+    // e.beta:  -180..180 (pitch, X axis)
+    // e.gamma:  -90..90  (roll,  Y axis)
+    // e.alpha:   0..360  (yaw,   Z axis) — not used
+    // Note: These are in the device coordinate frame; if you need portrait/landscape compensation, add it here.
+    pitch_deg = (e.beta  ?? 0);
+    roll_deg  = (e.gamma ?? 0);
+    rollEl.textContent  = isFinite(roll_deg)  ? roll_deg.toFixed(2)  : '--';
+    pitchEl.textContent = isFinite(pitch_deg) ? pitch_deg.toFixed(2) : '--';
+  }, { capture:false });
 }
+
 function startGPS(){
   if (!('geolocation' in navigator)){ setStatus(gpsStatus,'unavailable'); setDot(gpsDot,false); return; }
   navigator.geolocation.watchPosition(pos=>{
@@ -198,6 +162,8 @@ function startGPS(){
 }
 
 /*** MQTT ***/
+function topics(uid){ return { tele:`m5/${uid}/telemetry`, status:`m5/${uid}/status` }; }
+
 function connectMQTT(){
   const unitId=(unitIdIn.value||'web').trim(); localStorage.setItem('unitId',unitId);
   const url=brokerUrlIn.value.trim(), username=mqttUserIn.value.trim(), password=mqttPassIn.value;
@@ -221,16 +187,19 @@ function startPublishing(){
   pubTimer=setInterval(()=>{
     if(!connected) return;
     const unitId=(unitIdIn.value||'web').trim(), t=topics(unitId);
-    const {roll,pitch}=computeAngles(1/Math.max(1,hz));
+
     const gps_ok = (Date.now()-lastGpsTs) < 3000;
+    // If no orientation yet, send nulls (or replace with 0 if you prefer)
     const payload = gps_ok
-      ? {unit_id:unitId, seq:seq++, roll_deg:+roll.toFixed(2), pitch_deg:+pitch.toFixed(2), lat, lon}
-      : {unit_id:unitId, seq:seq++, roll_deg:+roll.toFixed(2), pitch_deg:+pitch.toFixed(2), lat:null, lon:null};
+      ? {unit_id:unitId, seq:seq++, roll_deg: finiteOrNull(roll_deg), pitch_deg: finiteOrNull(pitch_deg), lat, lon}
+      : {unit_id:unitId, seq:seq++, roll_deg: finiteOrNull(roll_deg), pitch_deg: finiteOrNull(pitch_deg), lat:null, lon:null};
+
     const json = JSON.stringify(payload);
     lastJson.textContent = json;
     client.publish(t.tele, json);
   }, period);
 }
+const finiteOrNull = (v)=> Number.isFinite(v) ? +v.toFixed(2) : null;
 
 /*** UI wiring ***/
 $('enableSensors').addEventListener('click', enableSensors);
